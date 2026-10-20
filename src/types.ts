@@ -34,6 +34,14 @@ export interface Ariza {
   interventions?: Intervention[];
   pausedOperators?: string[];
   helpers?: string[];
+  anaBakimci?: string;
+  yardimciBakimci?: string | string[];
+  arizaLog?: string;
+  durum?: string;
+  completedAt?: any;
+  completedBy?: string;
+  closedAt?: any;
+  closedBy?: string;
 }
 
 export interface Operator {

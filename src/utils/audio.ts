@@ -3,7 +3,7 @@ class SoundEffects {
   private ctx: AudioContext | null = null;
   public enabled: boolean = true;
 
-  private initCtx() {
+  public initCtx() {
     if (!this.ctx) {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       if (AudioCtx) {
@@ -76,6 +76,49 @@ class SoundEffects {
     } catch {
       // ignore
     }
+  }
+
+  // Attention chime before speaking new fault aloud (Promise based for sequencing)
+  playNewFaultAlarm(): Promise<void> {
+    if (!this.enabled) return Promise.resolve();
+    return new Promise((resolve) => {
+      try {
+        this.initCtx();
+        if (!this.ctx) {
+          resolve();
+          return;
+        }
+        const now = this.ctx.currentTime;
+
+        // Tone 1: 784 Hz (G5)
+        const osc1 = this.ctx.createOscillator();
+        const gain1 = this.ctx.createGain();
+        osc1.type = 'sine';
+        osc1.frequency.setValueAtTime(784, now);
+        gain1.gain.setValueAtTime(0.28, now);
+        gain1.gain.exponentialRampToValueAtTime(0.01, now + 0.18);
+        osc1.connect(gain1);
+        gain1.connect(this.ctx.destination);
+        osc1.start(now);
+        osc1.stop(now + 0.18);
+
+        // Tone 2: 1046.5 Hz (C6)
+        const osc2 = this.ctx.createOscillator();
+        const gain2 = this.ctx.createGain();
+        osc2.type = 'sine';
+        osc2.frequency.setValueAtTime(1046.5, now + 0.2);
+        gain2.gain.setValueAtTime(0.32, now + 0.2);
+        gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
+        osc2.connect(gain2);
+        gain2.connect(this.ctx.destination);
+        osc2.start(now + 0.2);
+        osc2.stop(now + 0.5);
+
+        setTimeout(resolve, 550);
+      } catch {
+        resolve();
+      }
+    });
   }
 }
 

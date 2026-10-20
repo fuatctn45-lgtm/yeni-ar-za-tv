@@ -10,13 +10,16 @@ import {
   parseFirestoreDate,
   formatTimeOnly,
   getEffectiveProductionDate,
-  isCreatedToday
+  isCreatedToday,
+  groupByTimeSlot
 } from './utils/date';
 import { soundFx } from './utils/audio';
+import { faultAnnouncer, AnnouncerStatus } from './utils/announcer';
 import { TvHeader } from './components/TvHeader';
 import { ArizaRow } from './components/ArizaRow';
 import { ArizaDetailModal } from './components/ArizaDetailModal';
 import { getJobTypeConfig } from './utils/jobColors';
+import { getActiveTechnicians, isFaultClosed } from './utils/technicians';
 import {
   X,
   Inbox,
@@ -44,7 +47,27 @@ export default function App() {
   // Anlık yeni arıza alarm bannerı
   const [newArrivalAlert, setNewArrivalAlert] = useState<Ariza | null>(null);
 
-  const [autoScroll, setAutoScroll] = useState(false);
+  // Sesli anons durumu (5 defa uyarı sesi + arızayı okuma)
+  const [announcerStatus, setAnnouncerStatus] = useState<AnnouncerStatus>({
+    isPlaying: false,
+    currentRepeat: 0,
+    totalRepeats: 5,
+    ariza: null,
+  });
+
+  useEffect(() => {
+    return faultAnnouncer.subscribe((status) => {
+      setAnnouncerStatus(status);
+      // Kullanıcı Kuralı: "yukada cıkan bildirm de ses ile birlikte kapansın"
+      // Sesli anons bittiğinde (5 tekrar tamamlandığında) veya susturulduğunda bildirim de otomatik kapanır
+      if (!status.isPlaying) {
+        setNewArrivalAlert(null);
+      }
+    });
+  }, []);
+
+  const autoScroll = false; // TV modunda varsayılan sabit veya kullanıcı kontrollü
+  const [isAutoScrollActive, setIsAutoScrollActive] = useState(false);
 
   // Bu oturumda anlık olarak canlı düşen arızaların kimlikleri
   const [sessionNewArrivalIds, setSessionNewArrivalIds] = useState<Set<string>>(new Set());
@@ -70,11 +93,12 @@ export default function App() {
         setIsOnline(true);
         markSync();
 
-        // Eğer anlık yeni bir veya daha fazla arıza eklendiyse
+        // Eğer anlık yeni bir veya daha fazla arıza eklendiyse:
+        // Kullanıcı Kuralı: "sisteme yeni arıza geldiğinde önce uyarı sesi versin dah sonra arızayı okusun bun 5 defa yapsın"
         if (newlyAddedItems.length > 0) {
           const newest = newlyAddedItems[newlyAddedItems.length - 1];
           setNewArrivalAlert(newest);
-          soundFx.playUrgentAlarm();
+          faultAnnouncer.announceFault(newest, 5);
 
           setSessionNewArrivalIds((prev) => {
             const next = new Set(prev);
@@ -87,8 +111,34 @@ export default function App() {
             scrollContainerRef.current.scrollTo({ top: 0, behavior: 'smooth' });
           }
         } else if (prevCountRef.current > 0 && data.length > prevCountRef.current) {
-          soundFx.playUrgentAlarm();
+          const newest = data[0];
+          if (newest) {
+            setNewArrivalAlert(newest);
+            faultAnnouncer.announceFault(newest, 5);
+          }
         }
+
+        // Eğer ekrandaki bildirimdeki arıza kapatıldıysa bildirimi ve sesi hemen kaldır
+        setNewArrivalAlert((curr) => {
+          if (!curr) return null;
+          const updated = data.find((d) => d.id === curr.id);
+          if (updated && isFaultClosed(updated)) {
+            faultAnnouncer.cancel();
+            return null;
+          }
+          return updated || curr;
+        });
+
+        // Kapatılan arızaları en üstte tutma setinden derhal temizle
+        setSessionNewArrivalIds((prev) => {
+          const next = new Set(prev);
+          data.forEach((d) => {
+            if (isFaultClosed(d)) {
+              next.delete(d.id);
+            }
+          });
+          return next;
+        });
 
         prevCountRef.current = data.length;
         setArizalar(data);
@@ -121,7 +171,7 @@ export default function App() {
 
   // 2. TV Otomatik Kaydırma Mekanizması
   useEffect(() => {
-    if (!autoScroll) return;
+    if (!isAutoScrollActive) return;
     const interval = setInterval(() => {
       if (!scrollContainerRef.current) return;
       const el = scrollContainerRef.current;
@@ -133,7 +183,7 @@ export default function App() {
       }
     }, 10000);
     return () => clearInterval(interval);
-  }, [autoScroll]);
+  }, [isAutoScrollActive]);
 
   // Manuel Yenileme
   const handleManualRefresh = async () => {
@@ -155,8 +205,8 @@ export default function App() {
 
   // 3. Sıralama Fonksiyonu: HER YENİ GELEN KESİNLİKLE EN ÜSTE GELECEK
   const getSortTimestamp = (a: Ariza): number => {
-    // Canlı oturumda yeni düşen bir kayıtsa en üstte tut
-    if (sessionNewArrivalIds.has(a.id)) {
+    // Canlı oturumda yeni düşen bir kayıt henüz kapatılmadıysa en üstte tut
+    if (sessionNewArrivalIds.has(a.id) && !isFaultClosed(a)) {
       return Number.MAX_SAFE_INTEGER;
     }
     const d = parseFirestoreDate(a.createdAt);
@@ -167,40 +217,35 @@ export default function App() {
     return d.getTime();
   };
 
-  // 4. Görünüm Modu: Tümü (Aktif + Eski ayrı), Sadece Aktif, Sadece Eski
-  const [viewMode, setViewMode] = useState<'tumu' | 'aktif' | 'eski'>('tumu');
-
   // Fabrika üretim/veri referans tarihi
   const effectiveDate = useMemo(() => getEffectiveProductionDate(arizalar), [arizalar]);
 
-  // ERTESİ GÜN (24:00 GEÇTİKTEN SONRAKİLER) ESKİ ARIZA:
-  // Kullanıcı Kuralı: "şöyle yapıyorsun ertesigün yani 24:00 dan sonrakiler eski arızalr oluyor"
-  // Gece 24:00 geçilip ertesi güne girildiğinde önceki günlerin tüm arızaları eski arıza olur.
-  // Aktif: Sadece bugünün takvim gününe (00:00:00 - 23:59:59) ait açık arızalar
-  // Eski: 24:00 öncesinden ertesi güne sarkanlar veya çözülen/tamamlananlar
-  const { activeArizalar, oldArizalar } = useMemo(() => {
+  // Kullanıcı Kuralı: "durum kaplı ise ekranda gösterme zaten arıza kapatılmış"
+  // Kapatılan arızalar (Kapalı, Kapatıldı, Tamamlandı, Çözüldü) açık arıza ekranında kesinlikle yer almaz.
+  const { activeArizalar, devredenArizalar, closedArizalar } = useMemo(() => {
     const active: Ariza[] = [];
-    const old: Ariza[] = [];
+    const devreden: Ariza[] = [];
+    const closed: Ariza[] = [];
 
     arizalar.forEach((a) => {
-      // 1. Çözüldü veya Tamamlandı ise doğrudan eski arızadır
-      if (a.status === 'Tamamlandı' || a.status === 'Çözüldü') {
-        old.push(a);
+      // 1. Kapalı, Kapatıldı, Çözüldü veya Tamamlandı ise doğrudan kapatılanlar listesine alınır
+      if (isFaultClosed(a)) {
+        closed.push(a);
         return;
       }
 
-      // 2. 24:00 sonrası ertesi güne girildiğinde dünden kalan arızalar eski arıza olur:
+      // 2. 24:00 sonrası ertesi güne girildiğinde dünden kalan henüz çözülmemiş açık arızalar
       const isToday = isCreatedToday(a.createdAt, effectiveDate, new Date());
       if (!isToday) {
-        old.push(a);
+        devreden.push(a);
         return;
       }
 
-      // Bugün açılmış ve henüz tamamlanmamış açık arızalar
+      // 3. Bugün açılmış ve henüz tamamlanmamış/kapatılmamış açık arızalar
       active.push(a);
     });
 
-    return { activeArizalar: active, oldArizalar: old };
+    return { activeArizalar: active, devredenArizalar: devreden, closedArizalar: closed };
   }, [arizalar, effectiveDate]);
 
   // Arızaları iş türüne göre gruplama fonksiyonu
@@ -278,31 +323,30 @@ export default function App() {
       g.items.sort((a, b) => getSortTimestamp(b) - getSortTimestamp(a));
     });
 
-    // Grupları öncelik sırasına göre diz ve sadece kaydı olanları döndür
-    const preferredOrder = ['is_guvenligi', 'elektrik', 'mekanik', 'planli_bakim', 'tekrar_eden', 'diger'];
-    const result: JobGroup[] = [];
-
-    preferredOrder.forEach((key) => {
-      if (groupsMap[key] && groupsMap[key].items.length > 0) {
-        result.push(groupsMap[key]);
-      }
+    // Kaydı olan grupları al ve EN YENİ ARIZA İÇEREN GRUBU DAİMA EN ÜSTE AL
+    const groupsWithItems = Object.values(groupsMap).filter((g) => g.items.length > 0);
+    groupsWithItems.sort((gA, gB) => {
+      const topA = gA.items.length > 0 ? getSortTimestamp(gA.items[0]) : 0;
+      const topB = gB.items.length > 0 ? getSortTimestamp(gB.items[0]) : 0;
+      return topB - topA;
     });
 
-    Object.keys(groupsMap).forEach((key) => {
-      if (!preferredOrder.includes(key) && groupsMap[key].items.length > 0) {
-        result.push(groupsMap[key]);
-      }
-    });
-
-    return result;
+    return groupsWithItems;
   };
 
-  const activeGroups = useMemo(() => groupListByJobType(activeArizalar), [activeArizalar, sessionNewArrivalIds]);
-  const oldGroups = useMemo(() => groupListByJobType(oldArizalar), [oldArizalar]);
+  // Kullanıcı İsteği: "gelen arızaları guruplandır şöyle 08 ile 10 arası 10 ile 12 arsı 12 ile 14 arası 14 iel 16 arsı satrı başlarında dikey olarak belirt"
+  const activeTimeGroups = useMemo(
+    () => groupByTimeSlot(activeArizalar, getSortTimestamp),
+    [activeArizalar, sessionNewArrivalIds]
+  );
+  const devredenTimeGroups = useMemo(
+    () => groupByTimeSlot(devredenArizalar, getSortTimestamp),
+    [devredenArizalar]
+  );
 
-  // Sayaçlar (Fabrika TV Panosu)
+  // Sayaçlar (Fabrika TV Panosu) - Sadece açık arızalar sayılır, kapatılanlar kesinlikle hariçtir
   const allUnresolved = useMemo(
-    () => arizalar.filter((a) => a.status !== 'Tamamlandı' && a.status !== 'Çözüldü'),
+    () => arizalar.filter((a) => !isFaultClosed(a)),
     [arizalar]
   );
   const totalOpen = allUnresolved.length;
@@ -327,14 +371,11 @@ export default function App() {
     [allUnresolved]
   );
 
-  // Bugün / 1 günden yeni açık arızalar
+  // Bugün açık arızalar
   const todayCount = activeArizalar.length;
 
-  // 1 günün üzerindeki açık arızalar (önceki günlerden devreden açıklar)
-  const pendingPreviousDaysCount = useMemo(
-    () => oldArizalar.filter((a) => a.status !== 'Tamamlandı' && a.status !== 'Çözüldü').length,
-    [oldArizalar]
-  );
+  // Önceki günlerden devreden açık arızalar
+  const pendingPreviousDaysCount = devredenArizalar.length;
 
   return (
     <div className="h-screen bg-slate-950 text-slate-100 flex flex-col font-sans select-none overflow-hidden">
@@ -348,41 +389,87 @@ export default function App() {
         isOnline={isOnline}
         lastSyncTime={lastSyncTime}
         onRefresh={handleManualRefresh}
-        autoScroll={autoScroll}
-        onToggleAutoScroll={() => setAutoScroll(!autoScroll)}
+        autoScroll={isAutoScrollActive}
+        onToggleAutoScroll={() => setIsAutoScrollActive(!isAutoScrollActive)}
       />
 
-      {/* ANLIK CANLI YENİ ARIZA DÜŞTÜ BİLDİRİM BANNERI (Köşeli) */}
+      {/* ANLIK CANLI YENİ İŞ İSTEK BİLDİRİMİ BANNERI (Köşeli, Ekranda Kalır & 5 Defa Sesli Anons) */}
       {newArrivalAlert && (
         <div className="bg-red-600 text-white px-3 py-1.5 flex items-center justify-between gap-3 border-b-2 border-black rounded-none shrink-0 z-30 shadow-lg">
-          <div className="flex items-center gap-2.5 min-w-0">
-            <span className="bg-black text-yellow-300 text-xs font-black uppercase px-2 py-0.5 rounded-none tracking-wider shrink-0 animate-pulse">
-              ⚡ YENİ ARIZA DÜŞTÜ
+          <div className="flex items-center gap-2.5 min-w-0 flex-wrap sm:flex-nowrap">
+            <span className="bg-black text-yellow-300 text-xs font-black uppercase px-2 py-0.5 rounded-none tracking-wider shrink-0 flex items-center gap-1.5">
+              <span>⚡ YENİ İŞ İSTEK BİLDİRİMİ GELDİ</span>
+              {announcerStatus.isPlaying && (
+                <span className="bg-red-700 text-white text-[10px] px-1.5 py-0.2 rounded-none font-mono tracking-normal">
+                  🔊 ANONS: {announcerStatus.currentRepeat}/{announcerStatus.totalRepeats}
+                </span>
+              )}
             </span>
             <span className="text-xs font-mono text-slate-200 shrink-0">
               {formatTimeOnly(newArrivalAlert.createdAt)}
             </span>
             <span className="text-xs font-black truncate text-white">
-              {newArrivalAlert.machine} • {newArrivalAlert.jobType}
+              Makine Adı: <span className="text-yellow-200">{newArrivalAlert.machine}</span>
             </span>
-            <span className="hidden md:inline text-xs text-white/90 truncate max-w-md">
-              {newArrivalAlert.description}
+            <span className="text-xs font-bold text-white/95 shrink-0">
+              • Arıza Türü: <span className="text-yellow-100">{newArrivalAlert.jobType}</span>
+            </span>
+            {(() => {
+              const { anaBakimci: alertAna, yardimciBakimcilar: alertYardimcilar } = getActiveTechnicians(newArrivalAlert);
+              return (
+                <>
+                  {alertAna && (
+                    <span className="text-xs font-bold text-cyan-200 shrink-0">
+                      • Ana Bakımcı: {alertAna}
+                    </span>
+                  )}
+                  {alertYardimcilar.length > 0 && (
+                    <span className="text-xs font-bold text-amber-200 shrink-0">
+                      • Yardımcı: {alertYardimcilar.join(', ')}
+                    </span>
+                  )}
+                </>
+              );
+            })()}
+            <span className="text-xs text-white/95 truncate max-w-xs sm:max-w-md lg:max-w-lg">
+              • Açıklama: <span className="text-slate-100 font-semibold">{newArrivalAlert.description || 'Belirtilmedi'}</span>
             </span>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+            {announcerStatus.isPlaying ? (
+              <button
+                onClick={() => faultAnnouncer.cancel()}
+                className="px-2 py-0.5 rounded-none bg-black text-yellow-300 font-bold text-xs hover:bg-slate-900 transition-colors border border-yellow-400/40 uppercase"
+                title="Sesli anonsu sustur"
+              >
+                Sesi Sustur
+              </button>
+            ) : (
+              <button
+                onClick={() => faultAnnouncer.announceFault(newArrivalAlert, 5)}
+                className="px-2 py-0.5 rounded-none bg-black text-amber-300 font-bold text-xs hover:bg-slate-900 transition-colors border border-amber-400/40 uppercase"
+                title="Sesli anonsu baştan 5 defa oku"
+              >
+                Tekrar Oku (5x)
+              </button>
+            )}
             <button
               onClick={() => {
+                faultAnnouncer.cancel();
                 setSelectedAriza(newArrivalAlert);
-                setNewArrivalAlert(null);
               }}
               className="px-2.5 py-0.5 rounded-none bg-black text-white font-black text-xs hover:bg-slate-900 transition-colors border border-white/20 uppercase"
             >
               Görüntüle
             </button>
             <button
-              onClick={() => setNewArrivalAlert(null)}
+              onClick={() => {
+                faultAnnouncer.cancel();
+                setNewArrivalAlert(null);
+              }}
               className="p-1 hover:bg-black/30 rounded-none transition-colors text-white"
+              title="Bildirimi Kapat"
             >
               <X className="w-4 h-4" />
             </button>
@@ -390,102 +477,67 @@ export default function App() {
         </div>
       )}
 
-      {/* TABLO SÜTUN BAŞLIKLARI VE GÖRÜNÜM SEÇİCİ (Köşeli, Kompakt, Hizalı) */}
-      <div className="bg-slate-900 border-b border-black text-[11px] font-bold uppercase text-slate-300 px-2 sm:px-3 py-1 flex items-center justify-between gap-2 tracking-wider rounded-none shrink-0 z-10 shadow-xs">
-        {/* Sol Kısım: Görünüm Seçici (Tümü / Aktif / Eski) + Hizalı Başlıklar */}
-        <div className="flex items-center gap-2 min-w-0 flex-1">
-          <div className="inline-flex rounded-none border border-black bg-black/60 p-0.5 gap-0.5 shrink-0">
-            <button
-              onClick={() => setViewMode('tumu')}
-              className={`px-2 py-0.5 rounded-none text-[11px] font-bold uppercase tracking-wider transition-colors ${
-                viewMode === 'tumu'
-                  ? 'bg-amber-500 text-black'
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              TÜMÜ ({arizalar.length})
-            </button>
-            <button
-              onClick={() => setViewMode('aktif')}
-              className={`px-2 py-0.5 rounded-none text-[11px] font-bold uppercase tracking-wider transition-colors ${
-                viewMode === 'aktif'
-                  ? 'bg-red-600 text-white'
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              AKTİF ({activeArizalar.length})
-            </button>
-            <button
-              onClick={() => setViewMode('eski')}
-              className={`px-2 py-0.5 rounded-none text-[11px] font-bold uppercase tracking-wider transition-colors ${
-                viewMode === 'eski'
-                  ? 'bg-emerald-600 text-white'
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              ESKİ ARIZALAR ({oldArizalar.length})
-            </button>
-          </div>
-
-          <div className="hidden sm:flex items-center gap-2 text-[11px] font-bold text-slate-400 truncate">
-            <span className="w-36 sm:w-48 lg:w-56 truncate">MAKİNE</span>
-            <span>|</span>
-            <span className="truncate">ARIZA AÇIKLAMASI</span>
-          </div>
+      {/* TABLO SÜTUN BAŞLIKLARI (Köşeli, Kompakt, Hizalı) */}
+      <div className="bg-slate-900 border-b border-black text-[11px] font-bold uppercase text-slate-300 flex items-stretch rounded-none shrink-0 z-10 shadow-xs">
+        {/* Sol Kısım: SAAT Dikey Kolonu Başlığı */}
+        <div className="w-16 sm:w-20 shrink-0 bg-slate-950 border-r border-black flex items-center justify-center py-1 text-amber-300 font-mono text-center tracking-wider font-black text-[11px]">
+          SAAT
         </div>
 
-        {/* Sağ Kısım Sütun Başlıkları */}
-        <div className="flex items-center gap-3 shrink-0 text-right text-[11px] font-bold text-slate-400 uppercase">
-          <span className="hidden md:inline">ARIZA TÜRÜ</span>
-          <span className="hidden sm:inline">GÖREVLİ</span>
-          <span className="w-24 text-right">SÜRE / SAAT</span>
+        {/* Sağ Kısım: Satır Başlıkları */}
+        <div className="flex-1 flex items-center justify-between gap-1.5 sm:gap-2 px-2 sm:px-3 py-1 min-w-0">
+          <div className="flex items-center gap-1.5 sm:gap-2 min-w-0 flex-1 text-[11px] font-bold text-slate-400 truncate">
+            <span className="w-20 sm:w-24 shrink-0 text-slate-400">DURUM</span>
+            <span>|</span>
+            <span className="w-36 sm:w-48 lg:w-56 shrink-0 truncate text-slate-300">MAKİNE</span>
+            <span>|</span>
+            <span className="truncate text-slate-400">ARIZA AÇIKLAMASI</span>
+          </div>
+
+          <div className="flex items-center gap-2 sm:gap-3 shrink-0 text-right text-[11px] font-bold text-slate-400 uppercase">
+            <span className="hidden md:inline">ARIZA TÜRÜ</span>
+            <span className="hidden sm:inline">BAKIMCILAR (ANA / YRD)</span>
+            <span className="w-24 text-right">SÜRE / SAAT</span>
+          </div>
         </div>
       </div>
 
-      {/* ANA SATIR LİSTESİ: İŞ TÜRÜNE GÖRE GRUPLANMIŞ, ESKİ ARIZALAR AYRILMIŞ, TÜM YAZILAR AYNI VE KÜÇÜK */}
+      {/* ANA SATIR LİSTESİ: KAPATILAN ARIZALAR EKRANDA GÖSTERİLMEZ (SADECE AÇIKLAR LİSTELENİR) */}
       <main
         ref={scrollContainerRef}
-        className="flex-1 overflow-y-auto bg-slate-950 scroll-smooth"
+        className="flex-1 overflow-y-auto bg-slate-950 flex flex-col scroll-smooth"
       >
-        {/* 1. AKTİF ARIZALAR BÖLÜMÜ (Tümü veya Aktif seçiliyse) */}
-        {(viewMode === 'tumu' || viewMode === 'aktif') && (
-          <div>
-            {/* Tümü seçiliyse ana bölüm başlığı */}
-            {viewMode === 'tumu' && (
-              <div className="bg-slate-950 border-b border-black text-[11px] font-bold uppercase text-red-400 px-2.5 sm:px-3 py-0.5 flex items-center justify-between tracking-wider">
-                <div className="flex items-center gap-1.5">
-                  <span className="w-2 h-2 bg-red-500 animate-pulse" />
-                  <span>AKTİF ARIZALAR (BUGÜN • İŞ TÜRÜNE GÖRE GRUPLU • {activeArizalar.length} KAYIT)</span>
-                </div>
-              </div>
-            )}
-
-            {activeGroups.length === 0 ? (
-              <div className="p-4 text-center text-[11px] font-bold text-slate-500 uppercase tracking-wider bg-slate-950">
-                Şu an bugüne ait bekleyen veya işlem gören aktif arıza kaydı bulunmuyor.
-              </div>
-            ) : (
-              activeGroups.map((group) => (
-                <div key={`active-${group.key}`} className="w-full">
-                  {/* İŞ TÜRÜ GRUP BAŞLIĞI (Köşeli, Kompakt, Renk Göstergeli) */}
-                  <div
-                    className="border-b border-black text-[11px] font-bold uppercase px-2.5 sm:px-3 py-0.5 flex items-center justify-between tracking-wider bg-slate-900 text-slate-200"
-                  >
-                    <div className="flex items-center gap-2">
-                      <span
-                        className="w-2.5 h-2.5 inline-block shrink-0 border border-black"
-                        style={{ backgroundColor: group.hex }}
-                      />
-                      <span className="text-white">{group.name}</span>
-                      <span className="text-slate-400 font-mono text-[11px]">({group.items.length})</span>
-                    </div>
-                    <span className="text-[11px] font-mono text-slate-400 hidden sm:inline">
-                      {group.items.length} Açık Kayıt
+        {/* 1. AKTİF / BUGÜNÜN AÇIK ARIZALARI BÖLÜMÜ (EN ÜSTTE - 2 SAATLİK DİKEY ZAMAN DİLİMLERİ) */}
+        <div className="w-full">
+          {activeTimeGroups.length === 0 ? (
+            <div className="p-4 text-center text-[11px] font-bold text-slate-500 uppercase tracking-wider bg-slate-950">
+              Şu an bugüne ait bekleyen veya işlem gören açık arıza kaydı bulunmuyor.
+            </div>
+          ) : (
+            <div className="flex flex-col w-full divide-y-0">
+              {activeTimeGroups.map((group) => (
+                <div key={`active-slot-${group.slotKey}`} className="flex w-full border-b border-black">
+                  {/* Satır Başında Dikey Zaman Dilimi (Örn: 08:00 - 10:00) */}
+                  <div className="w-16 sm:w-20 shrink-0 bg-slate-950 border-r border-black/80 flex flex-col items-center justify-center py-1 px-1 select-none font-mono">
+                    <span className="text-[11px] sm:text-xs font-black text-amber-300 tracking-wider">
+                      {group.startStr}
                     </span>
+                    <div className="flex flex-col items-center my-0.5">
+                      <div className="w-0.5 h-1.5 bg-amber-400/40" />
+                      <span className="text-[8px] text-amber-500 font-black leading-none">▼</span>
+                    </div>
+                    <span className="text-[11px] sm:text-xs font-black text-amber-300 tracking-wider">
+                      {group.endStr}
+                    </span>
+                    {group.items.length > 1 && (
+                      <span className="text-[9px] font-mono font-bold text-slate-400 mt-1 bg-slate-900 px-1 border border-slate-800">
+                        {group.items.length} kayıt
+                      </span>
+                    )}
                   </div>
 
-                  {/* Bu gruptaki satırlar (Boşluksuz, Dar, Köşeli, Aynı Font Boyutu) */}
-                  <div className="flex flex-col w-full divide-y-0">
+                  {/* Bu saat aralığındaki arıza satırları */}
+                  <div className="flex-1 flex flex-col min-w-0 divide-y divide-black/30">
                     {group.items.map((ariza) => (
                       <ArizaRow
                         key={ariza.id}
@@ -497,50 +549,51 @@ export default function App() {
                     ))}
                   </div>
                 </div>
-              ))
-            )}
-          </div>
-        )}
-
-        {/* 2. ESKİ / TAMAMLANAN ARIZALAR BÖLÜMÜ (24:00 Öncesinden Devredenler & Çözülenler) */}
-        {(viewMode === 'tumu' || viewMode === 'eski') && (
-          <div className={viewMode === 'tumu' ? 'mt-2 border-t-2 border-black' : ''}>
-            {/* Eski Arızalar Belirgin Ayırıcı Başlığı */}
-            <div className="bg-slate-900 border-y-2 border-emerald-500/50 text-[11px] font-bold uppercase text-emerald-400 px-2.5 sm:px-3 py-1 flex items-center justify-between tracking-wider shadow-xs">
-              <div className="flex items-center gap-2">
-                <span>ESKİ ARIZALAR (24:00 ÖNCESİNDEN DEVREDENLER & ARŞİV • {oldArizalar.length} KAYIT - İŞ TÜRÜNE GÖRE AYRILMIŞTIR)</span>
-              </div>
-              <span className="text-[11px] font-mono text-slate-400 hidden sm:inline">
-                DEVREDEN & GEÇMİŞ
-              </span>
+              ))}
             </div>
+          )}
+        </div>
 
-            {oldGroups.length === 0 ? (
-              <div className="p-4 text-center text-[11px] font-bold text-slate-500 uppercase tracking-wider bg-slate-950">
-                24:00 öncesinden devreden veya tamamlanmış eski arıza bulunmuyor.
-              </div>
-            ) : (
-              oldGroups.map((group) => (
-                <div key={`old-${group.key}`} className="w-full">
-                  {/* Eski Grup Başlığı (Sade, Kompakt, Kayıt Sayılı) */}
-                  <div
-                    className="border-b border-black text-[10px] font-bold uppercase px-2.5 sm:px-3 py-0.5 flex items-center justify-between tracking-wider bg-slate-950/95 text-slate-400"
-                  >
-                    <div className="flex items-center gap-1.5">
-                      <span
-                        className="w-2.5 h-2.5 inline-block shrink-0 border border-black"
-                        style={{ backgroundColor: group.hex }}
-                      />
-                      <span className="text-slate-200">{group.name}</span>
-                      <span className="text-slate-400 font-mono text-[10px]">({group.items.length})</span>
-                    </div>
-                    <span className="text-[10px] font-mono text-slate-400 hidden sm:inline">
-                      {group.items.length} Kayıt
+        {/* 2. DEVREDEN AÇIK ARIZALAR BÖLÜMÜ (ALTA ÇEKİLDİ - 24:00 Öncesinden Devredenler) */}
+        <div className="mt-auto pt-4 border-t-2 border-slate-800 w-full">
+          <div className="bg-slate-900 border-y-2 border-amber-500/50 text-[11px] font-bold uppercase text-amber-400 px-2.5 sm:px-3 py-1 flex items-center justify-between tracking-wider shadow-xs">
+            <div className="flex items-center gap-2">
+              <span>DEVREDEN ARIZALAR (24:00 ÖNCESİNDEN DEVREDENLER • {devredenArizalar.length} KAYIT)</span>
+            </div>
+            <span className="text-[11px] font-mono text-slate-400 hidden sm:inline">
+              DEVREDEN (ALTA ÇEKİLDİ)
+            </span>
+          </div>
+
+          {devredenTimeGroups.length === 0 ? (
+            <div className="p-4 text-center text-[11px] font-bold text-slate-500 uppercase tracking-wider bg-slate-950">
+              24:00 öncesinden devreden açık arıza bulunmuyor.
+            </div>
+          ) : (
+            <div className="flex flex-col w-full divide-y-0">
+              {devredenTimeGroups.map((group) => (
+                <div key={`devreden-slot-${group.slotKey}`} className="flex w-full border-b border-black">
+                  {/* Satır Başında Dikey Zaman Dilimi */}
+                  <div className="w-16 sm:w-20 shrink-0 bg-slate-950 border-r border-black/80 flex flex-col items-center justify-center py-1 px-1 select-none font-mono">
+                    <span className="text-[10px] sm:text-[11px] font-black text-amber-400/90 tracking-wider">
+                      {group.startStr}
                     </span>
+                    <div className="flex flex-col items-center my-0.5">
+                      <div className="w-0.5 h-1.5 bg-amber-500/30" />
+                      <span className="text-[8px] text-amber-600 font-black leading-none">▼</span>
+                    </div>
+                    <span className="text-[10px] sm:text-[11px] font-black text-amber-400/90 tracking-wider">
+                      {group.endStr}
+                    </span>
+                    {group.items.length > 1 && (
+                      <span className="text-[9px] font-mono font-bold text-slate-500 mt-1 bg-slate-900 px-1 border border-slate-800">
+                        {group.items.length} kayıt
+                      </span>
+                    )}
                   </div>
 
-                  {/* Bu gruptaki eski satırlar: Boyut ve stil aynı, küçük text-[11px], font-bold */}
-                  <div className="flex flex-col w-full divide-y-0">
+                  {/* Arıza Satırları */}
+                  <div className="flex-1 flex flex-col min-w-0 divide-y divide-black/30">
                     {group.items.map((ariza) => (
                       <ArizaRow
                         key={ariza.id}
@@ -552,20 +605,20 @@ export default function App() {
                     ))}
                   </div>
                 </div>
-              ))
-            )}
-          </div>
-        )}
+              ))}
+            </div>
+          )}
+        </div>
       </main>
 
       {/* ALT ÇUBUK: Minimal, köşeli */}
       <footer className="bg-slate-950 border-t border-slate-900 px-3 py-1 text-xs text-slate-400 flex items-center justify-between gap-2 rounded-none">
         <div className="flex items-center gap-2 text-xs">
           <span className="font-bold text-white uppercase tracking-wider">
-            TOPLAM: {arizalar.length} KAYIT (AKTİF: {activeArizalar.length} • ESKİ: {oldArizalar.length})
+            AÇIK ARIZA: {totalOpen} (BUGÜN: {activeArizalar.length} • DEVREDEN: {devredenArizalar.length})
           </span>
           <span>•</span>
-          <span className="text-slate-400">İş Türüne Göre Gruplandı & Ayrıldı</span>
+          <span className="text-emerald-400 font-semibold">KAPATILAN: {closedArizalar.length}</span>
         </div>
         <div className="flex items-center gap-2 font-mono text-xs text-slate-400">
           <span className="w-2 h-2 rounded-none bg-emerald-400 animate-pulse inline-block" />

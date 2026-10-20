@@ -3,6 +3,7 @@ import { ChevronRight } from 'lucide-react';
 import { Ariza } from '../types';
 import { formatElapsedTime, formatTimeOnly, formatDateFull } from '../utils/date';
 import { getJobTypeConfig } from '../utils/jobColors';
+import { getActiveTechnicians, isFaultClosed } from '../utils/technicians';
 
 interface ArizaRowProps {
   ariza: Ariza;
@@ -21,53 +22,46 @@ export const ArizaRow: React.FC<ArizaRowProps> = ({
   const isDark = Boolean(jobConfig.isDarkBg);
 
   const statusLower = (ariza.status || '').toLowerCase();
-  const isUnderIntervention = (
+  const isResolved = isFaultClosed(ariza);
+
+  const isUnderIntervention = !isResolved && (
     statusLower.includes('müdahale') ||
     statusLower.includes('mudahale') ||
     statusLower.includes('işlem') ||
     statusLower.includes('islem') ||
     Boolean(ariza.startedBy)
   );
-  const activeOperator = ariza.startedBy || ariza.assignedTo || ariza.lastInterventionBy || '';
 
-  const isWaitingParts = ariza.status === 'Parça Bekliyor';
-  const isHandedOver = ariza.status === 'Devredildi';
-  const isResolved = ariza.status === 'Tamamlandı' || ariza.status === 'Çözüldü';
+  const isWaitingParts = !isResolved && ariza.status === 'Parça Bekliyor';
+  const isHandedOver = !isResolved && ariza.status === 'Devredildi';
 
   // Durum metni (Kutucuksuz, düz ve net metin)
-  const statusText = isUnderIntervention
+  const statusText = isResolved
+    ? 'KAPANDI'
+    : isUnderIntervention
     ? 'MÜDAHALE'
     : isWaitingParts
     ? 'PARÇA BEKLİYOR'
     : isHandedOver
     ? 'DEVREDİLDİ'
-    : isResolved
-    ? 'ÇÖZÜLDÜ'
     : 'BEKLİYOR';
 
-  // Yardımcılar
-  const helpersSet = new Set<string>();
-  if (Array.isArray(ariza.helpers)) {
-    ariza.helpers.forEach((h) => {
-      if (typeof h === 'string' && h.trim()) helpersSet.add(h.trim());
-    });
-  }
-  if (Array.isArray(ariza.interventions)) {
-    ariza.interventions.forEach((inv) => {
-      if (
-        (inv.status === 'Yardımcı' || inv.role === 'Yardımcı' || inv.actionTaken?.includes('Yardım') || inv.logAction?.includes('YARDIM')) &&
-        inv.operator
-      ) {
-        helpersSet.add(inv.operator.trim());
-      }
-      if (Array.isArray(inv.helpers)) {
-        inv.helpers.forEach((h) => {
-          if (typeof h === 'string' && h.trim()) helpersSet.add(h.trim());
-        });
-      }
-    });
-  }
-  const helpersList = Array.from(helpersSet);
+  // Aktif Ana Bakımcı ve Yardımcı Bakımcılar (Ayrılanlar kesinlikle yer almaz)
+  const { anaBakimci, yardimciBakimcilar: helpersList } = getActiveTechnicians(ariza);
+
+  // 3. Arıza Logu / Son Yapılan İşlem
+  const lastIntervention =
+    Array.isArray(ariza.interventions) && ariza.interventions.length > 0
+      ? ariza.interventions[ariza.interventions.length - 1]
+      : null;
+
+  const arizaLogText =
+    lastIntervention?.actionTaken ||
+    lastIntervention?.logAction ||
+    ariza.arizaLog ||
+    ariza.actionTaken ||
+    '';
+
   const elapsed = formatElapsedTime(ariza.createdAt);
   const timeOnly = formatTimeOnly(ariza.createdAt);
 
@@ -85,15 +79,15 @@ export const ArizaRow: React.FC<ArizaRowProps> = ({
       className={`group w-full ${
         isOld ? 'h-7 sm:h-7.5' : 'h-8 sm:h-8.5'
       } rounded-none border-b border-black/40 hover:brightness-95 active:brightness-90 transition-all duration-100 cursor-pointer px-2 sm:px-3 flex items-center justify-between gap-1.5 sm:gap-2 select-none relative whitespace-nowrap overflow-hidden text-[11px] font-bold ${textColor} ${
-        isNewArrival ? 'ring-2 ring-inset ring-red-600 animate-pulse' : ''
+        isNewArrival ? 'ring-2 ring-inset ring-red-600' : ''
       }`}
     >
-      {/* Sol Kısım: Durum + Makine İsmi + Ayırıcı + Açıklama (Arka plan kutusu YOK, logo/ikon YOK) */}
+      {/* Sol Kısım: Durum + Makine İsmi + Ayırıcı + Açıklama + Varsa Log Özeti */}
       <div className="flex items-center gap-1.5 sm:gap-2 min-w-0 flex-1 overflow-hidden">
-        {/* Durum Metni (Siyah kutu yok, logo yok, doğrudan düz yazı) */}
+        {/* Durum Metni (Siyah kutu yok, logo yok, doğrudan düz yazı - yanıp sönme yok) */}
         <div className="shrink-0 flex items-center w-20 sm:w-24">
           {isNewArrival && (
-            <span className="text-[11px] font-black uppercase mr-1 animate-pulse">
+            <span className="text-[11px] font-black uppercase mr-1">
               [YENİ]
             </span>
           )}
@@ -129,31 +123,34 @@ export const ArizaRow: React.FC<ArizaRowProps> = ({
         </span>
       </div>
 
-      {/* Sağ Kısım: Arıza Türü + Görevli + Geçen Süre (Arka plan kutusu YOK, logo/ikon YOK) */}
+      {/* Sağ Kısım: Arıza Türü + Ana Bakımcı + Yardımcı Bakımcı + Log + Geçen Süre */}
       <div className="flex items-center gap-2 sm:gap-3 shrink-0 overflow-hidden text-[11px] font-bold">
         {/* Arıza Türü (Siyah kutucuk yok, logo yok) */}
         <span className="text-[11px] font-bold uppercase tracking-wider shrink-0 hidden md:inline">
           {ariza.jobType || jobConfig.name}
         </span>
 
-        {/* Görevli Operatör (Siyah kutucuk yok, logo yok) */}
-        {activeOperator ? (
-          <span className="hidden sm:inline text-[11px] font-bold uppercase truncate max-w-[100px] lg:max-w-[140px]">
-            {activeOperator}
+        {/* Ana Bakımcı (Siyah kutucuk yok, logo yok) */}
+        {anaBakimci ? (
+          <span
+            className="hidden sm:inline text-[11px] font-bold uppercase truncate max-w-[110px] lg:max-w-[140px]"
+            title={`Ana Bakımcı: ${anaBakimci}`}
+          >
+            Ana: {anaBakimci}
           </span>
         ) : ariza.userName ? (
-          <span className="hidden sm:inline text-[11px] font-bold truncate max-w-[90px]">
+          <span className="hidden sm:inline text-[11px] font-bold truncate max-w-[90px]" title={`Bildiren: ${ariza.userName}`}>
             {ariza.userName}
           </span>
         ) : null}
 
-        {/* Yardımcılar (Siyah kutucuk yok, logo yok) */}
+        {/* Yardımcı Bakımcı (Siyah kutucuk yok, logo yok) */}
         {helpersList.length > 0 && (
           <span
-            className="hidden lg:inline text-[11px] font-bold truncate max-w-[110px]"
-            title={`Yardımcılar: ${helpersList.join(', ')}`}
+            className="hidden md:inline text-[11px] font-bold uppercase truncate max-w-[110px] lg:max-w-[140px] opacity-90"
+            title={`Yardımcı Bakımcı: ${helpersList.join(', ')}`}
           >
-            +{helpersList.join(', ')}
+            Yrd: {helpersList.join(', ')}
           </span>
         )}
 

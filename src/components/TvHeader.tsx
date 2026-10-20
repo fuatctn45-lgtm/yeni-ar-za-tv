@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import { getCurrentShift } from '../utils/date';
 import { soundFx } from '../utils/audio';
+import { faultAnnouncer } from '../utils/announcer';
 
 interface TvHeaderProps {
   totalOpen: number;
@@ -87,7 +88,11 @@ export const TvHeader: React.FC<TvHeaderProps> = ({
     const next = !soundEnabled;
     setSoundEnabled(next);
     soundFx.enabled = next;
-    if (next) soundFx.playChime();
+    if (next) {
+      soundFx.playChime();
+    } else {
+      faultAnnouncer.cancel();
+    }
   };
 
   const currentShift = getCurrentShift();

@@ -1,3 +1,5 @@
+import { Ariza } from '../types';
+
 /**
  * Date and time parsing helpers for Firestore timestamps and TV display
  */
@@ -188,4 +190,73 @@ export function getCurrentShift(): string {
   } else {
     return '3.VARDİYA 16:00 // 00:00';
   }
+}
+
+export interface TimeSlotGroup {
+  slotKey: string;
+  label: string;
+  startStr: string;
+  endStr: string;
+  startHour: number;
+  endHour: number;
+  items: Ariza[];
+}
+
+/**
+ * 2 Saatlik Zaman Dilimi Tespiti:
+ * 08:00 - 10:00, 10:00 - 12:00, 12:00 - 14:00, 14:00 - 16:00 vb.
+ */
+export function getTimeSlotInfo(val: any): {
+  slotKey: string;
+  label: string;
+  startStr: string;
+  endStr: string;
+  startHour: number;
+  endHour: number;
+} {
+  const d = parseFirestoreDate(val);
+  const now = new Date();
+  const dateObj = d || now;
+  const h = dateObj.getHours();
+  const startHour = Math.floor(h / 2) * 2;
+  const endHour = startHour + 2 === 24 ? 24 : (startHour + 2) % 24;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const slotKey = `${pad(startHour)}-${pad(endHour)}`;
+  const label = `${pad(startHour)}:00 - ${pad(endHour)}:00`;
+  const startStr = `${pad(startHour)}:00`;
+  const endStr = `${pad(endHour)}:00`;
+  return { slotKey, label, startStr, endStr, startHour, endHour };
+}
+
+/**
+ * Arızaları 2 saatlik zaman dilimlerine göre (08-10, 10-12, 12-14, 14-16 vb.) gruplar.
+ * En yeni zaman dilimi en üstte yer alır.
+ */
+export function groupByTimeSlot(list: Ariza[], getSortTimestamp: (a: Ariza) => number): TimeSlotGroup[] {
+  const slotsMap: Record<string, TimeSlotGroup> = {};
+
+  list.forEach((ariza) => {
+    const slot = getTimeSlotInfo(ariza.createdAt);
+    if (!slotsMap[slot.slotKey]) {
+      slotsMap[slot.slotKey] = {
+        ...slot,
+        items: [],
+      };
+    }
+    slotsMap[slot.slotKey].items.push(ariza);
+  });
+
+  // Her slot içindeki arızaları en yeni üstte olacak şekilde sırala
+  Object.values(slotsMap).forEach((g) => {
+    g.items.sort((a, b) => getSortTimestamp(b) - getSortTimestamp(a));
+  });
+
+  // Zaman dilimlerini sırala: En yeni saat dilimi en üstte
+  const sortedSlots = Object.values(slotsMap).sort((a, b) => {
+    const topA = a.items.length > 0 ? getSortTimestamp(a.items[0]) : 0;
+    const topB = b.items.length > 0 ? getSortTimestamp(b.items[0]) : 0;
+    return topB - topA;
+  });
+
+  return sortedSlots;
 }

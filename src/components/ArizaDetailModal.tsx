@@ -22,6 +22,7 @@ import {
 import { Ariza, Intervention } from '../types';
 import { formatDateFull, formatElapsedTime } from '../utils/date';
 import { getJobTypeConfig } from '../utils/jobColors';
+import { getActiveTechnicians, isFaultClosed } from '../utils/technicians';
 
 interface ArizaDetailModalProps {
   ariza: Ariza | null;
@@ -40,40 +41,21 @@ export const ArizaDetailModal: React.FC<ArizaDetailModalProps> = ({
   const isSafetyCritical = jobConfig.key === 'is_guvenligi';
   const isRecurring = jobConfig.key === 'tekrar_eden';
 
-  // Active intervention check
-  const activeOperator = ariza.startedBy || ariza.assignedTo || ariza.lastInterventionBy || '';
+  // Aktif Ana Bakımcı ve Yardımcı Bakımcılar (Ayrılanlar dahil edilmez)
+  const { anaBakimci, yardimciBakimcilar: helpersList } = getActiveTechnicians(ariza);
+
+  const isResolved = isFaultClosed(ariza);
   const statusLower = (ariza.status || '').toLowerCase();
-  const isUnderIntervention = (
+  const isUnderIntervention = !isResolved && (
     statusLower.includes('müdahale') ||
     statusLower.includes('mudahale') ||
     statusLower.includes('işlem') ||
     statusLower.includes('islem') ||
-    Boolean(ariza.startedBy)
+    Boolean(ariza.startedBy) ||
+    Boolean(anaBakimci)
   );
 
-  // Extract helpers reliably
-  const helpersSet = new Set<string>();
-  if (Array.isArray(ariza.helpers)) {
-    ariza.helpers.forEach((h) => {
-      if (typeof h === 'string' && h.trim()) helpersSet.add(h.trim());
-    });
-  }
-  if (Array.isArray(ariza.interventions)) {
-    ariza.interventions.forEach((inv) => {
-      if (
-        (inv.status === 'Yardımcı' || inv.role === 'Yardımcı' || inv.actionTaken?.includes('Yardım') || inv.logAction?.includes('YARDIM')) &&
-        inv.operator
-      ) {
-        helpersSet.add(inv.operator.trim());
-      }
-      if (Array.isArray(inv.helpers)) {
-        inv.helpers.forEach((h) => {
-          if (typeof h === 'string' && h.trim()) helpersSet.add(h.trim());
-        });
-      }
-    });
-  }
-  const helpersList = Array.from(helpersSet);
+  const activeOperator = anaBakimci || ariza.userName || '';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-slate-950/85 backdrop-blur-sm animate-in fade-in duration-200">
@@ -112,14 +94,38 @@ export const ArizaDetailModal: React.FC<ArizaDetailModalProps> = ({
 
         {/* Modal Body: Read-only Andon inspection */}
         <div className="p-6 overflow-y-auto space-y-5 flex-1">
-          {/* Active Intervention Alert Banner */}
-          {isUnderIntervention ? (
-            <div className="p-4 rounded-xl bg-cyan-950/80 border-2 border-cyan-400 text-cyan-200 space-y-2 shadow-lg animate-pulse">
+          {/* Arıza Durum Paneli */}
+          {isResolved ? (
+            <div className="p-4 rounded-none bg-emerald-950/80 border-2 border-emerald-500 text-emerald-200 space-y-2 shadow-lg">
               <div className="flex items-center justify-between gap-3 flex-wrap">
                 <div className="flex items-center gap-2.5">
-                  <span className="w-3 h-3 rounded-full bg-cyan-400 animate-ping" />
+                  <span className="w-3 h-3 bg-emerald-400" />
                   <span className="font-black text-sm tracking-wide">
-                    👤 MÜDAHALE EDİLİYOR ({activeOperator || 'Teknisyen'})
+                    ✅ ARIZA KAPATILDI / TAMAMLANDI
+                  </span>
+                </div>
+                {ariza.completedAt && (
+                  <span className="text-xs font-mono text-emerald-300">
+                    Kapanış: {formatDateFull(ariza.completedAt)}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-4 pt-2 border-t border-emerald-800/80 text-xs flex-wrap">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-emerald-400 font-bold">Kapatan Bakımcı:</span>
+                  <span className="text-white font-extrabold uppercase">
+                    {ariza.completedBy || anaBakimci || 'Yetkili'}
+                  </span>
+                </div>
+              </div>
+            </div>
+          ) : isUnderIntervention ? (
+            <div className="p-4 rounded-xl bg-cyan-950/80 border-2 border-cyan-400 text-cyan-200 space-y-2 shadow-lg">
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-3 h-3 rounded-full bg-cyan-400" />
+                  <span className="font-black text-sm tracking-wide">
+                    👤 MÜDAHALE EDİLİYOR
                   </span>
                 </div>
                 {ariza.startedAt && (
@@ -128,27 +134,38 @@ export const ArizaDetailModal: React.FC<ArizaDetailModalProps> = ({
                   </span>
                 )}
               </div>
-              {helpersList.length > 0 && (
-                <div className="text-xs font-bold text-amber-300 flex items-center gap-1.5 pt-1 border-t border-cyan-800/80">
-                  <span>🤝 Yardımcılar:</span>
-                  <span className="text-white font-extrabold">{helpersList.join(', ')}</span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-2 border-t border-cyan-800/80 text-xs">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-cyan-400 font-bold">Ana Bakımcı:</span>
+                  <span className="text-white font-extrabold uppercase">{anaBakimci || 'Atanmadı'}</span>
                 </div>
-              )}
+                <div className="flex items-center gap-1.5">
+                  <span className="text-amber-300 font-bold">Yardımcı Bakımcı:</span>
+                  <span className="text-white font-extrabold uppercase">
+                    {helpersList.length > 0 ? helpersList.join(', ') : 'Yok'}
+                  </span>
+                </div>
+              </div>
             </div>
           ) : (
-            <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800 flex items-center justify-between text-xs">
+            <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800 flex items-center justify-between text-xs flex-wrap gap-2">
               <div className="flex items-center gap-2 font-bold text-slate-300">
                 <Flame className="w-4 h-4 text-amber-400" />
                 <span>Müdahale Durumu: <span className="text-white">{ariza.status}</span></span>
               </div>
-              {activeOperator && (
-                <span className="text-cyan-400 font-bold">Görevli: {activeOperator}</span>
-              )}
+              <div className="flex items-center gap-3">
+                {anaBakimci && (
+                  <span className="text-cyan-400 font-bold">Ana Bakımcı: {anaBakimci}</span>
+                )}
+                {helpersList.length > 0 && (
+                  <span className="text-amber-300 font-bold">Yardımcı: {helpersList.join(', ')}</span>
+                )}
+              </div>
             </div>
           )}
 
           {/* Quick Stats Grid */}
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-6 gap-3">
             <div className="bg-slate-950/60 border border-slate-800 p-3 rounded-xl">
               <div className="text-[11px] text-slate-400 font-semibold uppercase">Arıza Tipi</div>
               <div className="mt-1">
@@ -180,9 +197,16 @@ export const ArizaDetailModal: React.FC<ArizaDetailModalProps> = ({
             </div>
 
             <div className="bg-slate-950/60 border border-slate-800 p-3 rounded-xl">
-              <div className="text-[11px] text-slate-400 font-semibold uppercase">Görevli</div>
-              <div className="text-sm font-bold text-emerald-400 mt-1 truncate">
-                {activeOperator || 'Atanmadı'}
+              <div className="text-[11px] text-cyan-400 font-semibold uppercase">Ana Bakımcı</div>
+              <div className="text-sm font-bold text-cyan-300 mt-1 truncate uppercase">
+                {anaBakimci || 'Atanmadı'}
+              </div>
+            </div>
+
+            <div className="bg-slate-950/60 border border-slate-800 p-3 rounded-xl">
+              <div className="text-[11px] text-amber-400 font-semibold uppercase">Yardımcı Bakımcı</div>
+              <div className="text-sm font-bold text-amber-200 mt-1 truncate uppercase">
+                {helpersList.length > 0 ? helpersList.join(', ') : 'Yok'}
               </div>
             </div>
 

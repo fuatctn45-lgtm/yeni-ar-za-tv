@@ -41,11 +41,100 @@ const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
 export const db = getFirestore(app);
 
 /**
- * Subscribe to all 'arizalar' documents with real-time updates
- */
-/**
  * Subscribe to all 'arizalar' documents with real-time updates and change detection
  */
+/**
+ * Firestore dökümanını Ariza arayüzüne eksiksiz dönüştüren yardımcı fonksiyon.
+ * Ana Bakımcı, Yardımcı Bakımcı(lar) ve Arıza Logları dahil tüm alanları destekler.
+ */
+function mapDocToAriza(id: string, data: any): Ariza {
+  const anaBakimci =
+    data.anaBakimci ||
+    data.startedBy ||
+    data.assignedTo ||
+    data.mainOperator ||
+    data.leadOperator ||
+    data.operator ||
+    data.lastInterventionBy ||
+    '';
+
+  const rawHelpers =
+    data.helpers ||
+    data.yardimciBakimci ||
+    data.yardimcilar ||
+    data.yardimci ||
+    [];
+  const helpersList: string[] = [];
+  if (Array.isArray(rawHelpers)) {
+    rawHelpers.forEach((h: any) => {
+      if (typeof h === 'string' && h.trim()) helpersList.push(h.trim());
+    });
+  } else if (typeof rawHelpers === 'string' && rawHelpers.trim()) {
+    rawHelpers.split(',').forEach((s: string) => {
+      if (s.trim()) helpersList.push(s.trim());
+    });
+  }
+
+  const rawInterventions =
+    Array.isArray(data.interventions)
+      ? data.interventions
+      : Array.isArray(data.logs)
+      ? data.logs
+      : Array.isArray(data.arizaLoglari)
+      ? data.arizaLoglari
+      : [];
+
+  const logText =
+    data.arizaLog ||
+    data.actionTaken ||
+    data.yapilanIslem ||
+    data.log ||
+    '';
+
+  return {
+    id,
+    machine: data.machine || data.makine || data.makineAdi || data.machineName || 'Bilinmeyen Makine',
+    jobType: data.jobType || data.arizaTuru || data.isTuru || data.is_turu || data.type || 'Mekanik Arıza',
+    costCenter: data.costCenter || data.masrafMerkezi || '',
+    shift: data.shift || data.vardiya || '',
+    status: data.status || data.durum || 'Açık',
+    description:
+      data.description ||
+      data.aciklama ||
+      data.arizaAciklamasi ||
+      data.aciklamasi ||
+      data.detail ||
+      data.sorun ||
+      data.not ||
+      data.notlar ||
+      data.talep ||
+      '',
+    userName: data.userName || data.kullanici || '',
+    photoUrl: data.photoUrl || '',
+    photoUploadStatus: data.photoUploadStatus || '',
+    partsChanged: data.partsChanged || '',
+    actionTaken: logText,
+    resolvedData: data.resolvedData || null,
+    createdAt: data.createdAt,
+    startedBy: anaBakimci,
+    assignedTo: data.assignedTo || anaBakimci,
+    startedAt: data.startedAt || '',
+    lastInterventionBy: data.lastInterventionBy || anaBakimci,
+    lastInterventionAt: data.lastInterventionAt || data.startedAt || '',
+    interventions: rawInterventions,
+    pausedOperators: Array.isArray(data.pausedOperators) ? data.pausedOperators : [],
+    helpers: helpersList,
+    anaBakimci,
+    yardimciBakimci: helpersList,
+    arizaLog: logText,
+    durum: data.durum || data.status || '',
+    completedAt: data.completedAt || data.closedAt || data.resolvedAt || '',
+    completedBy: data.completedBy || data.closedBy || data.resolvedBy || '',
+    closedAt: data.closedAt || data.completedAt || '',
+    closedBy: data.closedBy || data.completedBy || '',
+  };
+}
+
 export function subscribeToArizalar(
   onData: (arizalar: Ariza[], newlyAddedItems?: Ariza[]) => void,
   onError?: (err: any) => void
@@ -60,64 +149,14 @@ export function subscribeToArizalar(
       const newItems: Ariza[] = [];
 
       snapshot.forEach((docSnap) => {
-        const data = docSnap.data();
-        const opName = data.startedBy || data.assignedTo || data.lastInterventionBy || '';
-        items.push({
-          id: docSnap.id,
-          machine: data.machine || 'Bilinmeyen Makine',
-          jobType: data.jobType || 'Mekanik Arıza',
-          costCenter: data.costCenter || '',
-          shift: data.shift || '',
-          status: data.status || 'Açık',
-          description: data.description || '',
-          userName: data.userName || '',
-          photoUrl: data.photoUrl || '',
-          photoUploadStatus: data.photoUploadStatus || '',
-          partsChanged: data.partsChanged || '',
-          actionTaken: data.actionTaken || '',
-          resolvedData: data.resolvedData || null,
-          createdAt: data.createdAt,
-          startedBy: data.startedBy || '',
-          assignedTo: data.assignedTo || '',
-          startedAt: data.startedAt || '',
-          lastInterventionBy: opName,
-          lastInterventionAt: data.lastInterventionAt || data.startedAt || '',
-          interventions: Array.isArray(data.interventions) ? data.interventions : [],
-          pausedOperators: Array.isArray(data.pausedOperators) ? data.pausedOperators : [],
-          helpers: Array.isArray(data.helpers) ? data.helpers : [],
-        });
+        items.push(mapDocToAriza(docSnap.id, docSnap.data()));
       });
 
       // Detect newly arriving jobs after initial boot
       if (!isInitialLoad) {
         snapshot.docChanges().forEach((change) => {
           if (change.type === 'added') {
-            const data = change.doc.data();
-            const opName = data.startedBy || data.assignedTo || data.lastInterventionBy || '';
-            newItems.push({
-              id: change.doc.id,
-              machine: data.machine || 'Yeni Makine',
-              jobType: data.jobType || 'Mekanik Arıza',
-              costCenter: data.costCenter || '',
-              shift: data.shift || '',
-              status: data.status || 'Açık',
-              description: data.description || '',
-              userName: data.userName || '',
-              photoUrl: data.photoUrl || '',
-              photoUploadStatus: data.photoUploadStatus || '',
-              partsChanged: data.partsChanged || '',
-              actionTaken: data.actionTaken || '',
-              resolvedData: data.resolvedData || null,
-              createdAt: data.createdAt,
-              startedBy: data.startedBy || '',
-              assignedTo: data.assignedTo || '',
-              startedAt: data.startedAt || '',
-              lastInterventionBy: opName,
-              lastInterventionAt: data.lastInterventionAt || data.startedAt || '',
-              interventions: Array.isArray(data.interventions) ? data.interventions : [],
-              pausedOperators: Array.isArray(data.pausedOperators) ? data.pausedOperators : [],
-              helpers: Array.isArray(data.helpers) ? data.helpers : [],
-            });
+            newItems.push(mapDocToAriza(change.doc.id, change.doc.data()));
           }
         });
       }
@@ -141,32 +180,7 @@ export async function fetchAllArizalarDirect(): Promise<Ariza[]> {
     const snapshot = await getDocs(colRef);
     const items: Ariza[] = [];
     snapshot.forEach((docSnap) => {
-      const data = docSnap.data();
-      const opName = data.startedBy || data.assignedTo || data.lastInterventionBy || '';
-      items.push({
-        id: docSnap.id,
-        machine: data.machine || 'Bilinmeyen Makine',
-        jobType: data.jobType || 'Mekanik Arıza',
-        costCenter: data.costCenter || '',
-        shift: data.shift || '',
-        status: data.status || 'Açık',
-        description: data.description || '',
-        userName: data.userName || '',
-        photoUrl: data.photoUrl || '',
-        photoUploadStatus: data.photoUploadStatus || '',
-        partsChanged: data.partsChanged || '',
-        actionTaken: data.actionTaken || '',
-        resolvedData: data.resolvedData || null,
-        createdAt: data.createdAt,
-        startedBy: data.startedBy || '',
-        assignedTo: data.assignedTo || '',
-        startedAt: data.startedAt || '',
-        lastInterventionBy: opName,
-        lastInterventionAt: data.lastInterventionAt || data.startedAt || '',
-        interventions: Array.isArray(data.interventions) ? data.interventions : [],
-        pausedOperators: Array.isArray(data.pausedOperators) ? data.pausedOperators : [],
-        helpers: Array.isArray(data.helpers) ? data.helpers : [],
-      });
+      items.push(mapDocToAriza(docSnap.id, docSnap.data()));
     });
     return items;
   } catch (error) {
